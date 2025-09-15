@@ -6,14 +6,10 @@ import uuid
 import whisper
 import json
 import os
-import subprocess
 import sys
 import traceback
 import tempfile
-import shutil
-import datetime
 from moviepy import VideoFileClip
-import imageio_ffmpeg
 from  utils.call_llm import  call_llm_for_tool
 from  utils.prompts import  _load_prompts
 
@@ -91,7 +87,7 @@ def cut_video_segments(input_video_path: str, segments_json: str, output_dir: st
 
 
 
-        # Отключаем tqdm/proglog, чтобы исключить запись в stderr/stdout
+
         os.environ['TQDM_DISABLE'] = '1'
         os.environ['TQDM_DISABLE_TTY'] = '1'
 
