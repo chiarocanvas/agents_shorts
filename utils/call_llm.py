@@ -22,7 +22,6 @@ def call_llm(
     api_key = os.getenv("OPENAI_API_KEY", "lm-studio")
 
     last_err: Optional[Exception] = None
-    # Ensure content payloads are strings to satisfy OpenAI-compatible servers
     user_content = str(text) if not isinstance(text, str) else text
 
     for attempt in range(retries + 1):
@@ -37,9 +36,8 @@ def call_llm(
             }
             # Prefer structured output if server supports it
             if response_format_json:
-                # Try OpenAI-style json_object first
                 create_kwargs["response_format"] = {"type": "json_object"}
-                # If explicit json schema provided and server supports it, pass it
+
                 if json_schema:
                     create_kwargs["response_format"] = {
                         "type": "json_schema",
@@ -55,25 +53,19 @@ def call_llm(
                     result = client.chat.completions.create(**create_kwargs)
                 else:
                     raise
-            # Prefer returning parsed JSON if model produced it
-            choice0 = result.choices[0]
-            msg = getattr(choice0, "message", None)
-            content: Any = None
-            if msg is not None:
-                content = getattr(msg, "content", None)
-            if content is None:
-                content = getattr(choice0, "text", None)
+
+            content = result.choices[0].message.content
 
             text_out = "" if content is None else str(content).strip()
-            # If structured mode was requested, do a single best-effort JSON parse; no extra heuristics
+
             if response_format_json:
                 try:
                     return _json.loads(text_out)
                 except Exception:
                     return {"raw": text_out}
-            # Non-structured mode: return raw text
+
             return {"raw": text_out}
-        except Exception as e:  # keep broad with limited retries
+        except Exception as e:  
             last_err = e
             if attempt < retries:
                 time.sleep(delay * (2 ** attempt))
