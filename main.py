@@ -16,22 +16,22 @@ def run():
         model_id=model_id,
         api_key=api_key,
     )
-
+    # change  for  yours case 
     python_exe = os.environ.get("PYTHON_EXE", r"D:\proga\envs\aligment_norm\python.exe")
     mcp_script = os.path.abspath("mcp_tools.py")
-
+    # we use  stdio so  we would  need  to  mute  all  stios 
     server_params = StdioServerParameters(
         command=python_exe,
         args=[mcp_script],
         env={**os.environ},
     )
 
-    # Минимальный контракт инструментов (без навязывания плана)
+
     with  open("promts/promts.yaml", 'r', encoding="utf-8") as f:
         tools_guide =  yaml.safe_load(f)
         
 
-    video_path = "https://www.youtube.com/watch?v=dfmTLtRhg0Q"
+    video_path = "https://www.youtube.com/watch?v=_cB1I23kJxA"
     task = f"""
     {tools_guide['tools']['system']}
 
