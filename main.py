@@ -31,7 +31,7 @@ def run():
         tools_guide =  yaml.safe_load(f)
         
 
-    video_path = "https://www.youtube.com/watch?v=_cB1I23kJxA"
+    video_path = "https://www.youtube.com/watch?v=R7HqLfDsb7E"
     task = f"""
     {tools_guide['tools']['system']}
 

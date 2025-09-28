@@ -9,12 +9,10 @@ import os
 import sys
 import traceback
 import tempfile
-from moviepy import VideoFileClip
-from  utils.call_llm import  call_llm_for_tool
-from  utils.prompts import  _load_prompts
-
-
-
+from moviepy import VideoFileClip, TextClip, CompositeVideoClip
+from utils.call_llm import call_llm_for_tool
+from utils.prompts import _load_prompts
+import math
 
 mcp = FastMCP("video_agent")
 
@@ -31,29 +29,101 @@ class _NullLogger:
 
     def error(self, msg):
         pass
-    
 
-    
-@mcp.tool()
-def cut_video_segments(input_video_path: str, segments_json: str, output_dir: str = "segments") -> list:
-    
+
+def create_subtitles_for_segment(segment_text: str, video_duration: float, 
+                               video_size: tuple = (1080, 1920)) -> TextClip:
     """
-    MCP Tool: Нарезает видео на сегменты по временным меткам из JSON
+    Создает субтитры для сегмента видео (оптимизировано для YouTube Shorts)
     
     Args:
-        input_video_path (str): Путь к исходному видеофайлу
-        segments_json (str): JSON строка с сегментами ИЛИ путь к JSON файлу
-        output_dir (str): Папка для сохранения сегментов (по умолчанию "segments")
+        segment_text: Текст субтитров
+        video_duration: Длительность видео в секундах
+        video_size: Размер видео (ширина, высота)
     
     Returns:
-        list: Список путей к созданным файлам сегментов
+        TextClip: Клип с субтитрами
+    """
+    # Настройки для YouTube Shorts (вертикальное видео)
+    font_size = min(video_size) // 25  # Адаптивный размер шрифта
     
+    # Разбиваем текст на слова для лучшего отображения
+    words = segment_text.split()
+    
+    # Ограничиваем количество слов в строке (для читаемости)
+    max_words_per_line = 4
+    lines = []
+    for i in range(0, len(words), max_words_per_line):
+        line = ' '.join(words[i:i + max_words_per_line])
+        lines.append(line)
+    
+    subtitle_text = '\n'.join(lines)
+    
+    # Создаем текстовый клип с обводкой
+    txt_clip = TextClip(
+        subtitle_text,
+        fontsize=font_size,
+        color='white',
+        font='Arial-Bold',
+        stroke_color='black',
+        stroke_width=2,
+        method='caption',
+        size=(video_size[0] * 0.9, None),  # 90% ширины экрана
+        align='center'
+    ).set_duration(video_duration)
+    
+    # Позиционируем субтитры внизу экрана (но не слишком низко)
+    txt_clip = txt_clip.set_position(('center', video_size[1] * 0.75))
+    
+    return txt_clip
+
+
+def split_transcript_for_long_video(transcript_data: dict, max_segments: int = 50) -> List[dict]:
+    """
+    Разбивает длинные видео на части для обработки LLM
+    
+    Args:
+        transcript_data: Полная транскрипция
+        max_segments: Максимальное количество сегментов в одной части
+    
+    Returns:
+        List[dict]: Список частей транскрипции
+    """
+    segments = transcript_data.get("segments", [])
+    
+    if len(segments) <= max_segments:
+        return [transcript_data]
+    
+    parts = []
+    for i in range(0, len(segments), max_segments):
+        part_segments = segments[i:i + max_segments]
+        
+        # Создаем текст для этой части
+        part_text = " ".join([seg.get("text", "") for seg in part_segments])
+        
+        part_data = {
+            "text": part_text,
+            "segments": part_segments,
+            "video_path": transcript_data.get("video_path"),
+            "part_number": (i // max_segments) + 1,
+            "total_parts": math.ceil(len(segments) / max_segments)
+        }
+        parts.append(part_data)
+    
+    return parts
+
+
+@mcp.tool()
+def cut_video_segments(input_video_path: str, segments_json: str, 
+                      output_dir: str = "segments", add_subtitles: bool = True) -> list:
+    """
+    MCP Tool: Нарезает видео на сегменты по временным меткам из JSON с возможностью добавления субтитров
     """
     try:
-
         if not os.path.exists(input_video_path):
             raise FileNotFoundError(f"Видеофайл не найден: {input_video_path}")
         
+        # Парсинг JSON (без изменений)
         try:
             if not segments_json or str(segments_json).strip() == "":
                 raise ValueError("JSON данные пустые")
@@ -81,80 +151,109 @@ def cut_video_segments(input_video_path: str, segments_json: str, output_dir: st
                 raise ValueError("Список segments пустой")
                     
         except (json.JSONDecodeError, KeyError, ValueError, FileNotFoundError) as e:
-            raise ValueError(f"Неверный формат JSON. Ожидается: {{'segments': [{{'start': float, 'end': float}}, ...]}}. Ошибка: {str(e)}")
+            raise ValueError(f"Неверный формат JSON. Ошибка: {str(e)}")
         
-        os.makedirs(output_dir, exist_ok = True)
-
-
-
-
-        os.environ['TQDM_DISABLE'] = '1'
-        os.environ['TQDM_DISABLE_TTY'] = '1'
-
-        video = VideoFileClip(input_video_path, audio=True)
-        output_files = []
+        os.makedirs(output_dir, exist_ok=True)
         
-        try:
-            base_name = os.path.splitext(os.path.basename(input_video_path))[0]
+        # КРИТИЧНО: Перенаправляем все потоки вывода
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        
+        # Создаем временные файлы для вывода
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_stdout, \
+             tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_stderr:
             
-            for i, segment in enumerate(segments):
+            sys.stdout = temp_stdout
+            sys.stderr = temp_stderr
+            
+            try:
+                os.environ['TQDM_DISABLE'] = '1'
+                os.environ['TQDM_DISABLE_TTY'] = '1'
+
+                video = VideoFileClip(input_video_path, audio=True)
+                output_files = []
+                base_name = os.path.splitext(os.path.basename(input_video_path))[0]
+                video_size = (video.w, video.h)
+                
+                for i, segment in enumerate(segments):
+                    try:
+                        start_time = float(segment["start"]) 
+                        end_time = float(segment["end"])
+                        segment_text = segment.get("text", "").strip()
+                    except Exception:
+                        continue
+
+                    duration = float(getattr(video, "duration", 0.0) or 0.0)
+                    if duration and duration > 0:
+                        start_time = max(0.0, min(start_time, duration))
+                        end_time = max(0.0, min(end_time, duration))
+
+                    if end_time - start_time <= 0.05:
+                        continue
+
+                    try:
+                        segment_clip = video.subclipped(start_time, end_time)
+                        clip_duration = end_time - start_time
+                        
+                        # Безопасно обрабатываем аудио
+                        has_audio = False
+                        try:
+                            if hasattr(segment_clip, 'audio') and segment_clip.audio is not None:
+                                segment_clip.audio.get_frame(0)
+                                has_audio = True
+                        except:
+                            segment_clip = segment_clip.without_audio()
+                            has_audio = False
+                        
+                        # Добавляем субтитры
+                        if add_subtitles and segment_text:
+                            try:
+                                subtitle_clip = create_subtitles_for_segment(
+                                    segment_text, clip_duration, video_size
+                                )
+                                segment_clip = CompositeVideoClip([segment_clip, subtitle_clip])
+                            except Exception:
+                                pass  # Продолжаем без субтитров
+                        
+                        output_filename = f"{base_name}_segment_{i+1:02d}_{start_time:.1f}-{end_time:.1f}s.mp4"
+                        output_path = os.path.join(output_dir, output_filename)
+                        
+                        # Простые параметры для экспорта
+                        segment_clip.write_videofile(
+                            output_path,
+                            codec="libx264",
+                            audio=has_audio,
+                            audio_codec="aac" if has_audio else None,
+                            fps=getattr(video, "fps", None) or 24,
+                            logger=None,
+                            verbose=False
+                        )
+                        
+                        output_files.append(output_path)
+                        segment_clip.close()
+                        
+                    except Exception:
+                        continue  # Пропускаем проблемный сегмент
+                
+                video.close()
+                return output_files
+                
+            finally:
+                # КРИТИЧНО: Восстанавливаем потоки вывода
+                sys.stdout = original_stdout  
+                sys.stderr = original_stderr
+                
+                # Удаляем временные файлы
                 try:
-                    start_time = float(segment["start"]) 
-                    end_time = float(segment["end"])      
-                except Exception:
-                    continue
-
-                duration = float(getattr(video, "duration", 0.0) or 0.0)
-                if duration and duration > 0:
-                    start_time = max(0.0, min(start_time, duration))
-                    end_time = max(0.0, min(end_time, duration))
-
-                if end_time - start_time <= 0.05:
-                    continue
-
-                segment_clip = video.subclipped(start_time, end_time)
-                
-
-                output_filename = f"{base_name}_segment_{i+1:02d}_{start_time:.1f}-{end_time:.1f}s.mp4"
-                output_path = os.path.join(output_dir, output_filename)
-                
-
-                has_audio = getattr(segment_clip, "audio", None) is not None
-
-
-                ff_params = ["-map", "0:v:0"]
-                if has_audio:
-                    ff_params += ["-map", "0:a?"]
-
-                    ff_params += ["-shortest"]
-
-
-                segment_clip.write_videofile(
-                    output_path,
-                    codec="libx264",
-                    audio=has_audio,
-                    audio_codec=("aac" if has_audio else None),
-                    audio_fps=(44100 if has_audio else None),
-                    bitrate=None,
-                    audio_bitrate=("192k" if has_audio else None),
-                    fps=getattr(video, "fps", None) or 24,
-                    ffmpeg_params=ff_params,
-                    logger=None
-                )
-                
-                output_files.append(output_path)
-                segment_clip.close()
+                    os.unlink(temp_stdout.name)
+                    os.unlink(temp_stderr.name)
+                except:
+                    pass
             
-            return output_files
-            
-        finally:
-            video.close(
-            )
     except Exception as e:
         error_info = {
             "error": str(e),
             "error_type": type(e).__name__,
-            "file_path": output_path,
             "traceback": traceback.format_exc()
         }
         
@@ -167,40 +266,69 @@ def cut_video_segments(input_video_path: str, segments_json: str, output_dir: st
         with open(error_path, "w", encoding="utf-8") as f:
             json.dump(error_info, f, ensure_ascii=False, indent=2)
         
-        print(f"Error saved to: {error_path}")
         return str(error_path)
-    
+
 
 @mcp.tool()
-def make_clips(path_to_transcribe:str) ->str:
-    """Higlight  intresting  moments  from  video  and  clip  it """
+def make_clips_chunked(path_to_transcribe: str, chunk_size: int = 50) -> str:
+    """
+    Обрабатывает длинные видео частями для избежания переполнения контекста LLM
+    
+    Args:
+        path_to_transcribe: Путь к файлу транскрипции
+        chunk_size: Размер чанка (количество сегментов)
+    
+    Returns:
+        str: Путь к объединенному файлу с клипами
+    """
     try:
-        with  open(path_to_transcribe, "r", encoding="utf-8") as f:
-            txt = json.load(f)
-        payload_text = json.dumps(txt, ensure_ascii=False)
-        result = call_llm_for_tool(tool_name="clipper", text=payload_text)
+        with open(path_to_transcribe, "r", encoding="utf-8") as f:
+            transcript_data = json.load(f)
         
-
-        if isinstance(result, dict):
-            data = result
-        else:
-            try:
-                data = json.loads(str(result))
-            except json.JSONDecodeError:
-                data = {"content": str(result)}
+        # Разбиваем на части
+        parts = split_transcript_for_long_video(transcript_data, chunk_size)
         
-        if not data:
-            raise ValueError("LLM вернул пустой результат")
+        all_clips = []
+        
+        for part in parts:
+            # Обрабатываем каждую часть отдельно
+            payload_text = json.dumps(part, ensure_ascii=False)
+            result = call_llm_for_tool(tool_name="clipper", text=payload_text)
+            
+            if isinstance(result, dict):
+                data = result
+            else:
+                try:
+                    data = json.loads(str(result))
+                except json.JSONDecodeError:
+                    data = {"content": str(result)}
+            
+            # Добавляем клипы из этой части
+            if data and "segments" in data:
+                part_clips = data["segments"]
+                # Добавляем информацию о части
+                for clip in part_clips:
+                    clip["source_part"] = part["part_number"]
+                all_clips.extend(part_clips)
+        
+        # Объединяем все клипы
+        final_data = {
+            "segments": all_clips,
+            "video_path": transcript_data.get("video_path"),
+            "total_parts_processed": len(parts),
+            "original_segments_count": len(transcript_data.get("segments", []))
+        }
         
         project_dir = Path.cwd()
         clips_dir = project_dir / "clips"
         clips_dir.mkdir(exist_ok=True)
-        clips_path = clips_dir / f"clips_{uuid.uuid4().hex}.json"
+        clips_path = clips_dir / f"clips_chunked_{uuid.uuid4().hex}.json"
         
         with open(clips_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(final_data, f, ensure_ascii=False, indent=2)
         
         return str(clips_path)
+        
     except Exception as e:
         error_info = {
             "error": str(e),
@@ -221,10 +349,66 @@ def make_clips(path_to_transcribe:str) ->str:
         print(f"Error saved to: {error_path}")
         return str(error_path)
 
-    
+
+@mcp.tool()
+def make_clips(path_to_transcribe: str) -> str:
+    """Highlight interesting moments from video and clip it (legacy function)"""
+    try:
+        with open(path_to_transcribe, "r", encoding="utf-8") as f:
+            txt = json.load(f)
         
-      
-    
+        # Проверяем размер транскрипции
+        segments_count = len(txt.get("segments", []))
+        
+        # Если сегментов много, используем chunked версию
+        if segments_count > 100:
+            print(f"Длинное видео ({segments_count} сегментов), используем chunked обработку")
+            return make_clips_chunked(path_to_transcribe, chunk_size=50)
+        
+        # Иначе обрабатываем как обычно
+        payload_text = json.dumps(txt, ensure_ascii=False)
+        result = call_llm_for_tool(tool_name="clipper", text=payload_text)
+        
+        if isinstance(result, dict):
+            data = result
+        else:
+            try:
+                data = json.loads(str(result))
+            except json.JSONDecodeError:
+                data = {"content": str(result)}
+        
+        if not data:
+            raise ValueError("LLM вернул пустой результат")
+        
+        project_dir = Path.cwd()
+        clips_dir = project_dir / "clips"
+        clips_dir.mkdir(exist_ok=True)
+        clips_path = clips_dir / f"clips_{uuid.uuid4().hex}.json"
+        
+        with open(clips_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        return str(clips_path)
+        
+    except Exception as e:
+        error_info = {
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "file_path": path_to_transcribe,
+            "traceback": traceback.format_exc()
+        }
+        
+        project_dir = Path.cwd()
+        transcripts_dir = project_dir / "clips" 
+        transcripts_dir.mkdir(exist_ok=True)
+        
+        error_path = transcripts_dir / f"clips_error_{uuid.uuid4().hex}.json"
+        
+        with open(error_path, "w", encoding="utf-8") as f:
+            json.dump(error_info, f, ensure_ascii=False, indent=2)
+        
+        print(f"Error saved to: {error_path}")
+        return str(error_path)
 
 
 @mcp.tool()
@@ -293,14 +477,9 @@ def transcribe(path: str) -> str:
         return str(error_path)
 
 
-
-
 @mcp.tool()
 def get_video(url: str) -> str:
-    """Download a video using yt_dlp and return an absolute file path as a string.
-
-    Returns: "C:/abs/path/to/file.mp4"
-    """
+    """Download a video using yt_dlp and return an absolute file path as a string."""
     try:
         project_dir = Path.cwd()
         downloads_dir = project_dir / "downloads"
@@ -309,33 +488,54 @@ def get_video(url: str) -> str:
         base_name = f"video_{uuid.uuid4().hex}"
         outtmpl = str(downloads_dir / f"{base_name}.%(ext)s")
 
-        ydl_opts = {
-            'outtmpl': outtmpl,
-            'format': 'best[ext=mp4]/best', 
-            'quiet': True,
-            'no_warnings': True,
-            'noprogress': True,
-            'logger': _NullLogger(),
-            'consoletitle': False,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        # Простые варианты настроек (от самого простого)
+        configs = [
+            {'format': None},  # Без указания формата вообще
+            {'format': 'worst'},  # Худшее качество
+            {'format': 'bestaudio/best'},  # Только аудио в крайнем случае
+        ]
+
+        for config in configs:
             try:
-                file_path = ydl.prepare_filename(info)
+                ydl_opts = {
+                    'outtmpl': outtmpl,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'noprogress': True,
+                    'logger': _NullLogger(),
+                    'consoletitle': False,
+                }
+                
+                # Добавляем формат только если он указан
+                if config['format']:
+                    ydl_opts['format'] = config['format']
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    file_path = ydl.prepare_filename(info)
+                    
+                p = Path(file_path)
+                if not p.exists():
+                    # Ищем любой скачанный файл
+                    for ext in ("mp4", "mkv", "webm", "m4a", "mp3", "wav", "mov"):
+                        candidate = p.with_suffix(f".{ext}")
+                        if candidate.exists():
+                            p = candidate
+                            break
+                
+                if p.exists():
+                    return str(p.resolve().as_posix())
+                    
             except Exception:
-                file_path = str(downloads_dir / 'video.mp4')
-        p = Path(file_path)
-        if not p.exists():
-            for ext in ("mp4", "mkv", "webm", "m4a", "mp3", "wav", "mov"):
-                candidate = p.with_suffix(f".{ext}")
-                if candidate.exists():
-                    p = candidate
-                    break
-        return str(p.resolve().as_posix())
+                continue  # Пробуем следующий конфиг
+        
+        raise Exception(f"Не удалось скачать видео: {url}")
+        
     except Exception as e:
         error_info = {
             "error": str(e),
             "error_type": type(e).__name__,
+            "url": url,
             "traceback": traceback.format_exc()
         }
         
